@@ -23,3 +23,6 @@ backend/.pytest_cache/
 
 # Ad-hoc screenshots taken while developing
 [0-9][0-9]-*.png
+
+# Personal notes kept alongside the project, not part of it
+question/
