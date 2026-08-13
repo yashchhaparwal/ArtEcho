@@ -18,9 +18,15 @@ export const Layout: React.FC = () => {
         <Outlet />
       </main>
 
+      {/* No top margin: the chat page sizes itself to the viewport, and any
+          extra height here pushes the document into a window-level scroll that
+          drags its header out of view. */}
       <footer className="relative z-10 border-t border-slate-800/80 bg-slate-950/60 py-6">
-        <div className="max-w-7xl mx-auto px-6 text-center text-sm text-slate-500">
-          Muse — FastAPI (Python) + React (Vite) + PostgreSQL & Alembic
+        <div className="max-w-7xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-2 text-sm text-slate-500">
+          <p>Muse — guided art conversation &amp; AI artwork synthesis</p>
+          <p className="text-xs text-slate-600">
+            Public-domain library · runs entirely on free, local models
+          </p>
         </div>
       </footer>
     </div>

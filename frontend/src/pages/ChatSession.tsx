@@ -1,16 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { ArrowLeft, Send, Loader2, Sparkles, Palette, CheckCircle2 } from 'lucide-react';
-import { sessionsApi, streamMessage } from '../services/api';
+import { sessionsApi, streamMessage, streamOpeningMessage } from '../services/api';
+import { resolveAssetUrl } from '../config';
 import type { ChatSession as ChatSessionType, ChatMessage, Artwork } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 
-const BACKEND_URL = 'http://localhost:8000';
-
-function resolveImageUrl(url: string): string {
-  if (!url) return '';
-  return url.startsWith('/') ? `${BACKEND_URL}${url}` : url;
-}
+const resolveImageUrl = resolveAssetUrl;
 
 const TypingDots: React.FC = () => (
   <div className="flex items-center gap-1 px-4 py-3">
@@ -86,17 +82,77 @@ export const ChatSessionPage: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [genError, setGenError] = useState('');
   const [streamingText, setStreamingText] = useState('');
+  /** Slow prerequisite before the first token, e.g. reading an upload. */
+  const [assistantStatus, setAssistantStatus] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortStreamRef = useRef<(() => void) | null>(null);
+  // Guards the opening request against strict-mode double effects.
+  const openingStartedRef = useRef(false);
 
   // Drop the connection if the user navigates away mid-reply.
   useEffect(() => () => abortStreamRef.current?.(), []);
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // Scroll the thread itself, not the element into view. `scrollIntoView`
+    // walks up and scrolls every scrollable ancestor including the window,
+    // which dragged the page header off screen on a short conversation.
+    const el = threadRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
   }, []);
+
+  /**
+   * Stream the opening question into a session that has none yet.
+   *
+   * Creating a session returns immediately now, so a brand-new thread arrives
+   * empty and the first question types itself in here — the same treatment
+   * every later reply already gets.
+   */
+  const requestOpeningMessage = useCallback(() => {
+    if (!sessionId || openingStartedRef.current) return;
+    openingStartedRef.current = true;
+
+    setIsSending(true);
+    setStreamingText('');
+
+    abortStreamRef.current = streamOpeningMessage(sessionId, {
+      onStatus: (detail) => setAssistantStatus(detail),
+      onToken: (text) => {
+        setAssistantStatus('');
+        setStreamingText((prev) => prev + text);
+      },
+      onDone: (payload) => {
+        setMessages((prev) =>
+          prev.some((m) => m.id === payload.id)
+            ? prev
+            : [...prev, {
+                id: payload.id,
+                session_id: payload.session_id,
+                sender: 'assistant',
+                content: payload.content,
+                created_at: payload.created_at,
+              }]
+        );
+        setIsSending(false);
+        setStreamingText('');
+        setAssistantStatus('');
+        abortStreamRef.current = null;
+        inputRef.current?.focus();
+      },
+      onError: (detail) => {
+        setError(`Could not start the conversation: ${detail}`);
+        setIsSending(false);
+        setStreamingText('');
+        setAssistantStatus('');
+        abortStreamRef.current = null;
+        // Let the user retry via the banner.
+        openingStartedRef.current = false;
+      },
+    });
+  }, [sessionId]);
 
   const loadSession = useCallback(async () => {
     if (!sessionId) return;
@@ -104,12 +160,13 @@ export const ChatSessionPage: React.FC = () => {
       const res = await sessionsApi.getById(sessionId);
       setSession(res.data);
       setMessages(res.data.messages);
+      if (res.data.messages.length === 0) requestOpeningMessage();
     } catch {
       setError('Failed to load session. It may not exist or you may not have access.');
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, requestOpeningMessage]);
 
   useEffect(() => {
     // Wait for auth loading to finish before deciding to redirect.
@@ -174,8 +231,21 @@ export const ChatSessionPage: React.FC = () => {
             ? { ...prev, is_ready_to_generate: prev.is_ready_to_generate || payload.ready_to_generate }
             : prev
         );
+        // The composer reopens here. Context extraction is still running on the
+        // server and reports back via onContext; re-fetching the session now
+        // would only read the pre-extraction state.
         finish();
-        sessionsApi.getById(sessionId).then((res) => setSession(res.data)).catch(() => {});
+      },
+      onContext: (payload) => {
+        setSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                context_summary: payload.context_summary,
+                is_ready_to_generate: prev.is_ready_to_generate || payload.ready_to_generate,
+              }
+            : prev
+        );
       },
       onError: async (detail) => {
         console.error('Streaming failed, falling back to the blocking endpoint', detail);
@@ -233,14 +303,18 @@ export const ChatSessionPage: React.FC = () => {
     setIsGenerating(true);
     setGenError('');
     try {
-      await sessionsApi.generateArtwork(sessionId, force);
-      navigate(`/session/${sessionId}/result`);
+      // Only queues the job — it comes back in milliseconds. The result page
+      // follows the job from here, so the user watches it happen instead of
+      // sitting on a frozen button for the ~45s the image actually takes.
+      const res = await sessionsApi.startGeneration(sessionId, force);
+      navigate(`/session/${sessionId}/result`, { state: { jobId: res.data.job_id } });
     } catch (err: any) {
       const msg = err.response?.data?.detail || 'Image generation failed. Please try again.';
       setGenError(msg);
-    } finally {
       setIsGenerating(false);
     }
+    // On success we've navigated away — leave `isGenerating` set so the button
+    // can't be fired twice during the transition.
   };
 
   const userTurns = messages.filter((m) => m.sender === 'user').length;
@@ -250,7 +324,10 @@ export const ChatSessionPage: React.FC = () => {
   const canGenerateEarly = !isReady && userTurns >= 1;
 
   return (
-    <div className="max-w-4xl mx-auto px-4 sm:px-6 py-6 flex flex-col h-[calc(100vh-88px)]">
+    // Height tracks the navbar's own responsive height (h-16 / sm:h-20) so the
+    // thread fills the viewport exactly and never spills into a page scroll.
+    // `dvh` keeps it honest on mobile, where the browser chrome comes and goes.
+    <div className="max-w-4xl mx-auto px-4 sm:px-6 py-4 sm:py-6 flex flex-col h-[calc(100dvh-4rem)] sm:h-[calc(100dvh-5rem)]">
       {/* Header */}
       <div className="flex items-start justify-between gap-4 mb-4">
         <div className="flex items-center gap-3">
@@ -311,7 +388,7 @@ export const ChatSessionPage: React.FC = () => {
       )}
 
       {/* Message Thread */}
-      <div className="flex-1 overflow-y-auto pr-1 space-y-1 scrollbar-thin scrollbar-thumb-slate-800">
+      <div ref={threadRef} className="flex-1 min-h-0 overflow-y-auto pr-1 space-y-1 scrollbar-slim">
         {messages.map((msg) => (
           <MessageBubble key={msg.id} msg={msg} />
         ))}
@@ -326,6 +403,13 @@ export const ChatSessionPage: React.FC = () => {
                   {streamingText}
                   <span className="inline-block w-1.5 h-4 ml-0.5 -mb-0.5 bg-amber-400 animate-pulse" />
                 </p>
+              ) : assistantStatus ? (
+                // Vision on an upload runs before any token can arrive; say so
+                // rather than showing dots for half a minute.
+                <div className="flex items-center gap-2.5 px-4 py-3">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                  <span className="text-sm text-slate-400">{assistantStatus}…</span>
+                </div>
               ) : (
                 <TypingDots />
               )}

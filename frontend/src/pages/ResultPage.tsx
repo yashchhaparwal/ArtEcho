@@ -1,18 +1,29 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import {
   ArrowLeft, Download, RefreshCw, Loader2, Sparkles, Palette,
   CheckCircle2, AlertCircle, ChevronDown, ChevronUp, BookOpen
 } from 'lucide-react';
-import { sessionsApi } from '../services/api';
-import type { SessionResultResponse, GeneratedArtworkResponse, CritiqueResponse } from '../services/api';
+import { sessionsApi, pollJob } from '../services/api';
+import type {
+  SessionResultResponse, GeneratedArtworkResponse, CritiqueResponse, Artwork,
+} from '../services/api';
 import { useAuth } from '../context/AuthContext';
+import { GenerationProgress, ArtworkSkeleton, JobErrorPanel } from '../components/GenerationProgress';
 
-const BACKEND = 'http://localhost:8000';
+import { resolveAssetUrl } from '../config';
 
-function resolveUrl(url: string): string {
-  if (!url) return '';
-  return url.startsWith('/') ? `${BACKEND}${url}` : url;
+// Measured against the free Pollinations tier: a cold generation sits around
+// 45s. The critique is slower — a vision pass plus a large single-shot document
+// from a local CPU model. Both only pace the progress bar.
+const EXPECTED_GENERATION_SECONDS = 45;
+const EXPECTED_CRITIQUE_SECONDS = 90;
+
+const resolveUrl = resolveAssetUrl;
+
+interface JobProgress {
+  stage: string;
+  elapsed: number;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -60,9 +71,10 @@ const ArtworkCritiquePanel: React.FC<{
   const [open, setOpen] = useState(true);
   if (!section) return null;
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+    <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden animate-fade-up">
       <button
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
         className="w-full flex items-center justify-between px-5 py-4 hover:bg-slate-800/50 transition"
       >
         <div className="flex items-center gap-2">
@@ -94,15 +106,21 @@ const ArtworkPanel: React.FC<{
   subtitle?: string;
 }> = ({ label, imageUrl, title, subtitle }) => {
   const [imgError, setImgError] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   return (
     <div className="flex flex-col gap-3">
       <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">{label}</p>
-      <div className="aspect-square rounded-2xl overflow-hidden bg-slate-800 border border-slate-700/60">
+      <div className="relative aspect-square rounded-2xl overflow-hidden bg-slate-800 border border-slate-700/60">
+        {/* The generated file is served fresh off disk; hold a shimmer until the
+            bitmap actually decodes so the panel never flashes an empty box. */}
+        {!loaded && !imgError && <div className="absolute inset-0 shimmer bg-slate-800/60" />}
         {!imgError ? (
           <img
             src={resolveUrl(imageUrl)}
             alt={title}
-            className="w-full h-full object-cover"
+            loading="lazy"
+            onLoad={() => setLoaded(true)}
+            className={`w-full h-full object-cover transition-opacity duration-500 ${loaded ? 'opacity-100' : 'opacity-0'}`}
             onError={() => setImgError(true)}
           />
         ) : (
@@ -119,80 +137,211 @@ const ArtworkPanel: React.FC<{
   );
 };
 
+const ReferencePanel: React.FC<{ references: Artwork[] }> = ({ references }) => {
+  if (references.length === 1) {
+    const ref = references[0];
+    return (
+      <ArtworkPanel
+        label="Reference Artwork"
+        imageUrl={ref.image_url}
+        title={ref.title}
+        subtitle={`${ref.artist}${ref.year ? ` · ${ref.year}` : ''}`}
+      />
+    );
+  }
+  return (
+    <div>
+      <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-3">
+        {references.length} Reference Artworks
+      </h3>
+      <div className="grid grid-cols-2 gap-3">
+        {references.map((ref) => (
+          <div key={ref.id} className="rounded-xl overflow-hidden bg-slate-900 border border-slate-800">
+            <div className="aspect-[4/3] bg-slate-800">
+              <img
+                src={resolveUrl(ref.image_url)}
+                alt={ref.title}
+                loading="lazy"
+                className="w-full h-full object-cover"
+              />
+            </div>
+            <div className="p-3">
+              <p className="text-xs font-semibold text-slate-200 truncate">{ref.title}</p>
+              <p className="text-xs text-slate-500 truncate">{ref.artist}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 // ── Main Result Page ──────────────────────────────────────────────────────────
 
 export const ResultPage: React.FC = () => {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { user } = useAuth();
+
+  // Set when arriving straight from the chat page's Generate button.
+  const incomingJobId = (location.state as { jobId?: string } | null)?.jobId ?? null;
 
   const [result, setResult] = useState<SessionResultResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isRegenerating, setIsRegenerating] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [savedOk, setSavedOk] = useState(false);
-  const [critiqueLoading, setCritiqueLoading] = useState(false);
   const [critique, setCritique] = useState<CritiqueResponse | null>(null);
   const [error, setError] = useState('');
   const [critiqueError, setCritiqueError] = useState('');
 
+  const [genProgress, setGenProgress] = useState<JobProgress | null>(null);
+  const [critiqueProgress, setCritiqueProgress] = useState<JobProgress | null>(null);
+
+  // Stop polling if the user navigates away mid-job. The job itself keeps
+  // running server-side, so coming back simply picks up the finished artwork.
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Guards against the auto-critique effect firing twice for one artwork.
+  const critiqueStartedFor = useRef<string | null>(null);
+
   const loadResult = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId) return null;
     try {
       const res = await sessionsApi.getResult(sessionId);
       setResult(res.data);
-      // Check if latest already has a critique
       if (res.data.latest_generated?.critique) {
         setCritique(res.data.latest_generated.critique);
       }
+      return res.data;
     } catch {
       setError('Failed to load results. Please try again.');
+      return null;
     } finally {
       setIsLoading(false);
     }
   }, [sessionId]);
 
-  const triggerCritique = useCallback(async () => {
-    if (!sessionId || critique || critiqueLoading) return;
-    setCritiqueLoading(true);
+  // ── critique ───────────────────────────────────────────────────────────────
+
+  const runCritique = useCallback(async () => {
+    if (!sessionId) return;
     setCritiqueError('');
+    setCritiqueProgress({ stage: 'Looking at your artwork', elapsed: 0 });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
-      const res = await sessionsApi.generateCritique(sessionId);
-      setCritique(res.data);
+      const started = await sessionsApi.startCritique(sessionId);
+
+      // Already critiqued — the server answers immediately, no job to follow.
+      if (started.data.status === 'done' && started.data.result) {
+        setCritique(started.data.result);
+        return;
+      }
+      if (!started.data.job_id) throw new Error('No critique job was returned.');
+
+      const critiqueResult = await pollJob<CritiqueResponse>(sessionId, started.data.job_id, {
+        signal: controller.signal,
+        onProgress: (job) =>
+          setCritiqueProgress({ stage: job.stage, elapsed: job.elapsed_seconds }),
+      });
+      setCritique(critiqueResult);
     } catch (err: any) {
-      setCritiqueError(err.response?.data?.detail || 'Critique generation failed.');
+      if (err?.name === 'AbortError' || err?.code === 'ERR_CANCELED') return;
+      setCritiqueError(
+        err?.response?.data?.detail || err?.message || 'Critique generation failed.'
+      );
     } finally {
-      setCritiqueLoading(false);
+      setCritiqueProgress(null);
     }
-  }, [sessionId, critique, critiqueLoading]);
+  }, [sessionId]);
+
+  // ── generation ─────────────────────────────────────────────────────────────
+
+  /** Follow a generation job that is already queued server-side. */
+  const followGeneration = useCallback(
+    async (jobId: string) => {
+      if (!sessionId) return;
+      setError('');
+      setGenProgress({ stage: 'Composing your prompt', elapsed: 0 });
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        await pollJob<GeneratedArtworkResponse>(sessionId, jobId, {
+          signal: controller.signal,
+          onProgress: (job) => setGenProgress({ stage: job.stage, elapsed: job.elapsed_seconds }),
+        });
+        setCritique(null);
+        critiqueStartedFor.current = null;
+        await loadResult();
+      } catch (err: any) {
+        if (err?.name === 'AbortError' || err?.code === 'ERR_CANCELED') return;
+        setError(err?.response?.data?.detail || err?.message || 'Image generation failed.');
+      } finally {
+        setGenProgress(null);
+      }
+    },
+    [sessionId, loadResult]
+  );
+
+  /**
+   * Start a generation and follow it.
+   *
+   * The endpoint is idempotent per session: if a job is already in flight —
+   * after a mid-generation refresh, say — this attaches to it rather than
+   * queueing a second 45-second call.
+   */
+  const startGeneration = useCallback(async () => {
+    if (!sessionId || genProgress) return;
+    setError('');
+    setGenProgress({ stage: 'Composing your prompt', elapsed: 0 });
+    try {
+      const started = await sessionsApi.startGeneration(sessionId, true);
+      if (!started.data.job_id) throw new Error('No generation job was returned.');
+      await followGeneration(started.data.job_id);
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || err?.message || 'Image generation failed.');
+      setGenProgress(null);
+    }
+  }, [sessionId, genProgress, followGeneration]);
+
+  // ── lifecycle ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!user) { navigate('/login'); return; }
-    loadResult();
-  }, [user, loadResult, navigate]);
+    loadResult().then((data) => {
+      // Arrived straight from the Generate button — pick the job up mid-flight.
+      if (incomingJobId && !data?.latest_generated) {
+        // Clear the router state so a refresh doesn't re-follow a stale job.
+        navigate(location.pathname, { replace: true, state: null });
+        followGeneration(incomingJobId);
+      }
+    });
+    // Deliberately runs once per session: re-running on every render would
+    // restart polling. Later refreshes go through loadResult directly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, sessionId]);
 
-  // Auto-trigger critique once result loads (non-blocking)
+  // Critique the newest artwork automatically, once it exists and isn't busy.
   useEffect(() => {
-    if (result?.latest_generated && !result.latest_generated.critique && !critique) {
-      triggerCritique();
-    }
-  }, [result, critique, triggerCritique]);
+    const latest = result?.latest_generated;
+    if (!latest || latest.critique || critique) return;
+    if (genProgress || critiqueProgress) return;
+    if (critiqueStartedFor.current === latest.id) return;
+    critiqueStartedFor.current = latest.id;
+    runCritique();
+  }, [result, critique, genProgress, critiqueProgress, runCritique]);
 
   const handleRegenerate = async () => {
-    if (!sessionId || isRegenerating) return;
-    setIsRegenerating(true);
-    setError('');
-    try {
-      await sessionsApi.generateArtwork(sessionId);
-      setCritique(null);
-      await loadResult();
-      triggerCritique();
-    } catch (err: any) {
-      const msg = err.response?.data?.detail || 'Regeneration failed. Please try again.';
-      setError(msg);
-    } finally {
-      setIsRegenerating(false);
-    }
+    if (genProgress) return;
+    setCritique(null);
+    critiqueStartedFor.current = null;
+    await startGeneration();
   };
 
   const handleSave = async () => {
@@ -211,19 +360,23 @@ export const ResultPage: React.FC = () => {
   const handleDownload = () => {
     const url = result?.latest_generated?.image_url;
     if (!url) return;
-    const fullUrl = resolveUrl(url);
     const a = document.createElement('a');
-    a.href = fullUrl;
+    a.href = resolveUrl(url);
     a.download = `muse-generated-${Date.now()}.png`;
     a.target = '_blank';
     a.click();
   };
 
+  // ── render ─────────────────────────────────────────────────────────────────
+
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-[70vh] text-slate-500">
-        <Loader2 className="w-8 h-8 animate-spin mr-3" />
-        Loading your results…
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+        <div className="h-8 w-64 rounded-lg bg-slate-800 shimmer mb-8" />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <ArtworkSkeleton label="Reference Artwork" />
+          <ArtworkSkeleton label="Generated Artwork" />
+        </div>
       </div>
     );
   }
@@ -239,9 +392,10 @@ export const ResultPage: React.FC = () => {
   }
 
   const latest: GeneratedArtworkResponse | null = result?.latest_generated ?? null;
-  const allReferences = result?.reference_artworks ?? [];
+  const allReferences = (result?.reference_artworks ?? []) as Artwork[];
   const primaryRef = allReferences[0];
   const allGenerations = result?.generated_artworks ?? [];
+  const isGenerating = genProgress !== null;
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
@@ -249,154 +403,144 @@ export const ResultPage: React.FC = () => {
       <div className="flex items-center gap-3 mb-8">
         <button
           onClick={() => navigate(`/session/${sessionId}`)}
-          className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-100 transition"
+          aria-label="Back to conversation"
+          className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-100 hover:border-slate-700 transition"
         >
           <ArrowLeft className="w-4 h-4" />
         </button>
-        <div>
-          <h1 className="text-2xl font-extrabold text-slate-100 tracking-tight">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-extrabold text-slate-100 tracking-tight truncate">
             {result?.session_title ?? 'Your Artwork Results'}
           </h1>
           <p className="text-slate-500 text-sm mt-0.5">
-            {allGenerations.length} generation{allGenerations.length !== 1 ? 's' : ''} · {latest?.model_provider ?? ''}
+            {allGenerations.length} generation{allGenerations.length !== 1 ? 's' : ''}
+            {latest?.model_provider ? ` · ${latest.model_provider}` : ''}
           </p>
         </div>
       </div>
 
-      {/* Error banner */}
-      {error && (
-        <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-rose-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <p className="text-rose-300 text-sm font-medium">{error}</p>
-            <button
-              onClick={handleRegenerate}
-              className="text-amber-400 hover:underline text-xs mt-1"
-            >
-              Try regenerating
-            </button>
-          </div>
+      {/* Generation error */}
+      {error && result && (
+        <div className="mb-6">
+          <JobErrorPanel message={error} onRetry={handleRegenerate} retryLabel="Try regenerating" />
+        </div>
+      )}
+
+      {/* Live generation progress */}
+      {isGenerating && (
+        <div className="mb-6">
+          <GenerationProgress
+            stage={genProgress.stage}
+            elapsedSeconds={genProgress.elapsed}
+            expectedSeconds={EXPECTED_GENERATION_SECONDS}
+            label={latest ? 'Creating a new artwork' : 'Creating your artwork'}
+          />
         </div>
       )}
 
       {/* Side-by-side artworks. A session can blend several references, so all
           of them are shown rather than only the first. */}
-      {latest && primaryRef && (
+      {primaryRef && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
-          {allReferences.length === 1 ? (
+          <ReferencePanel references={allReferences} />
+
+          {isGenerating && !latest ? (
+            <ArtworkSkeleton label="Generated Artwork" />
+          ) : latest ? (
             <ArtworkPanel
-              label="Reference Artwork"
-              imageUrl={primaryRef.image_url}
-              title={primaryRef.title}
-              subtitle={`${primaryRef.artist}${primaryRef.year ? ` · ${primaryRef.year}` : ''}`}
+              label={`Generated Artwork #${latest.generation_index}`}
+              imageUrl={latest.image_url}
+              title="Your Muse Creation"
+              subtitle={
+                allReferences.length > 1
+                  ? `Blended from ${allReferences.length} references`
+                  : `Inspired by ${primaryRef.title}`
+              }
             />
           ) : (
-            <div>
-              <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-3">
-                {allReferences.length} Reference Artworks
-              </h3>
-              <div className="grid grid-cols-2 gap-3">
-                {allReferences.map((ref) => (
-                  <div
-                    key={ref.id}
-                    className="rounded-xl overflow-hidden bg-slate-900 border border-slate-800"
-                  >
-                    <div className="aspect-[4/3] bg-slate-800">
-                      <img
-                        src={resolveUrl(ref.image_url)}
-                        alt={ref.title}
-                        className="w-full h-full object-cover"
-                      />
-                    </div>
-                    <div className="p-3">
-                      <p className="text-xs font-semibold text-slate-200 truncate">{ref.title}</p>
-                      <p className="text-xs text-slate-500 truncate">{ref.artist}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
+            <div className="flex flex-col justify-center items-center gap-4 rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-8 text-center">
+              <Sparkles className="w-8 h-8 text-slate-600" />
+              <p className="text-sm text-slate-400">No artwork has been generated for this session yet.</p>
+              <button
+                onClick={startGeneration}
+                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-rose-500 text-slate-950 font-semibold text-sm shadow-lg shadow-amber-500/20 hover:from-amber-400 hover:to-rose-400 transition"
+              >
+                Generate artwork
+              </button>
             </div>
           )}
-          <ArtworkPanel
-            label={`Generated Artwork #${latest.generation_index}`}
-            imageUrl={latest.image_url}
-            title="Your Muse Creation"
-            subtitle={
-              allReferences.length > 1
-                ? `Blended from ${allReferences.length} references`
-                : `Inspired by ${primaryRef.title}`
-            }
-          />
         </div>
       )}
 
       {/* Action buttons */}
-      <div className="flex flex-wrap gap-3 mb-10">
-        <button
-          onClick={handleRegenerate}
-          disabled={isRegenerating}
-          className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-200 hover:text-white transition disabled:opacity-50 text-sm font-medium"
-        >
-          {isRegenerating
-            ? <><Loader2 className="w-4 h-4 animate-spin" />Regenerating…</>
-            : <><RefreshCw className="w-4 h-4" />Regenerate</>
-          }
-        </button>
-        <button
-          onClick={handleDownload}
-          className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-200 hover:text-white transition text-sm font-medium"
-        >
-          <Download className="w-4 h-4" />
-          Download
-        </button>
-        <button
-          onClick={handleSave}
-          disabled={isSaving || savedOk}
-          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition disabled:opacity-50 ${
-            savedOk
-              ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
-              : 'bg-gradient-to-r from-amber-500 to-rose-500 text-slate-950 shadow-lg shadow-amber-500/20'
-          }`}
-        >
-          {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : savedOk ? <CheckCircle2 className="w-4 h-4" /> : <Sparkles className="w-4 h-4" />}
-          {savedOk ? 'Saved to Gallery!' : isSaving ? 'Saving…' : 'Save to Gallery'}
-        </button>
-      </div>
+      {latest && (
+        <div className="flex flex-wrap gap-3 mb-10">
+          <button
+            onClick={handleRegenerate}
+            disabled={isGenerating}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-200 hover:text-white hover:border-slate-600 transition disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+          >
+            {isGenerating
+              ? <><Loader2 className="w-4 h-4 animate-spin" />Regenerating…</>
+              : <><RefreshCw className="w-4 h-4" />Regenerate</>
+            }
+          </button>
+          <button
+            onClick={handleDownload}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-200 hover:text-white hover:border-slate-600 transition text-sm font-medium"
+          >
+            <Download className="w-4 h-4" />
+            Download
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={isSaving || savedOk}
+            className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition disabled:opacity-50 ${
+              savedOk
+                ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
+                : 'bg-gradient-to-r from-amber-500 to-rose-500 text-slate-950 shadow-lg shadow-amber-500/20 hover:from-amber-400 hover:to-rose-400'
+            }`}
+          >
+            {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : savedOk ? <CheckCircle2 className="w-4 h-4" /> : <Sparkles className="w-4 h-4" />}
+            {savedOk ? 'Saved to Gallery!' : isSaving ? 'Saving…' : 'Save to Gallery'}
+          </button>
+        </div>
+      )}
 
       {/* Critiques */}
-      <div className="space-y-4">
-        <h2 className="text-lg font-bold text-slate-100">Artwork Critique</h2>
+      {(latest || critique) && (
+        <div className="space-y-4">
+          <h2 className="text-lg font-bold text-slate-100">Artwork Critique</h2>
 
-        {critiqueLoading && (
-          <div className="flex items-center gap-3 p-5 bg-slate-900 border border-slate-800 rounded-2xl text-slate-400">
-            <Loader2 className="w-5 h-5 animate-spin text-amber-400" />
-            <span className="text-sm">Muse is analysing both artworks…</span>
-          </div>
-        )}
+          {critiqueProgress && (
+            <GenerationProgress
+              stage={critiqueProgress.stage}
+              elapsedSeconds={critiqueProgress.elapsed}
+              expectedSeconds={EXPECTED_CRITIQUE_SECONDS}
+              label="Muse is analysing both artworks"
+              patienceNote="The critique runs on your local model and is the slowest step — it's still working."
+            />
+          )}
 
-        {critiqueError && (
-          <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-between gap-3">
-            <p className="text-rose-300 text-sm">{critiqueError}</p>
-            <button onClick={triggerCritique} className="text-amber-400 hover:underline text-xs flex-shrink-0">
-              Retry
-            </button>
-          </div>
-        )}
+          {critiqueError && (
+            <JobErrorPanel message={critiqueError} onRetry={runCritique} retryLabel="Retry critique" />
+          )}
 
-        {critique && (
-          <>
-            <ArtworkCritiquePanel label="Reference Artwork Critique" section={critique.reference_critique ?? undefined} />
-            <ArtworkCritiquePanel label="Generated Artwork Critique" section={critique.generated_critique ?? undefined} />
+          {critique && (
+            <>
+              <ArtworkCritiquePanel label="Reference Artwork Critique" section={critique.reference_critique ?? undefined} />
+              <ArtworkCritiquePanel label="Generated Artwork Critique" section={critique.generated_critique ?? undefined} />
 
-            {critique.comparison && (
-              <div className="p-5 bg-gradient-to-br from-amber-500/5 to-rose-500/5 border border-amber-500/20 rounded-2xl">
-                <h4 className="text-xs font-semibold uppercase tracking-widest text-amber-400 mb-3">Comparative Analysis</h4>
-                <p className="text-sm text-slate-300 leading-relaxed">{critique.comparison}</p>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+              {critique.comparison && (
+                <div className="p-5 bg-gradient-to-br from-amber-500/5 to-rose-500/5 border border-amber-500/20 rounded-2xl animate-fade-up">
+                  <h4 className="text-xs font-semibold uppercase tracking-widest text-amber-400 mb-3">Comparative Analysis</h4>
+                  <p className="text-sm text-slate-300 leading-relaxed">{critique.comparison}</p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {/* Prompt used */}
       {latest?.prompt_synthesized && (

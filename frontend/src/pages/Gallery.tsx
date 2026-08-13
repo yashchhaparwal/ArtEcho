@@ -7,11 +7,10 @@ import {
 import { galleryApi, sessionsApi } from '../services/api';
 import type { GalleryItem } from '../services/api';
 
-const BACKEND_URL = 'http://localhost:8000';
+import { resolveAssetUrl } from '../config';
 
 function resolveImageUrl(url?: string): string {
-  if (!url) return '';
-  return url.startsWith('/') ? `${BACKEND_URL}${url}` : url;
+  return resolveAssetUrl(url);
 }
 
 export const GalleryPage: React.FC = () => {

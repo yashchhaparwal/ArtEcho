@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import type { Artwork } from '../services/api';
+import { resolveAssetUrl } from '../config';
 import { Calendar, Palette, X, MessageSquare, ExternalLink, Check, Plus } from 'lucide-react';
 
 interface ArtworkCardProps {
@@ -19,9 +20,7 @@ export const ArtworkCard: React.FC<ArtworkCardProps> = ({
   const [showModal, setShowModal] = useState(false);
   const [imgError, setImgError] = useState(false);
 
-  const imageUrl = artwork.image_url.startsWith('/')
-    ? `http://localhost:8000${artwork.image_url}`
-    : artwork.image_url;
+  const imageUrl = resolveAssetUrl(artwork.image_url);
 
   const handleCardClick = () => setShowModal(true);
 

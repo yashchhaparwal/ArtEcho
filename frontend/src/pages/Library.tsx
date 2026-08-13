@@ -6,6 +6,7 @@ import { artworksApi, sessionsApi } from '../services/api';
 import type { Artwork } from '../services/api';
 import { ArtworkCard } from '../components/ArtworkCard';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../config';
 
 const PAGE_SIZE = 24;
 
@@ -299,11 +300,7 @@ export const Library: React.FC = () => {
                   title={`${artwork.title} — ${artwork.artist}`}
                 >
                   <img
-                    src={
-                      artwork.image_url.startsWith('/')
-                        ? `http://localhost:8000${artwork.image_url}`
-                        : artwork.image_url
-                    }
+                    src={resolveAssetUrl(artwork.image_url)}
                     alt={artwork.title}
                     className="w-full h-full object-cover"
                   />
