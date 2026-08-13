@@ -25,7 +25,7 @@ def test_full_phase5():
     s1 = client.post('/api/v1/sessions', headers=H, json={'reference_artwork_ids': [starry['id']]}).json()
     client.post(f"/api/v1/sessions/{s1['id']}/messages", headers=H, json={'content': 'I love blue swirling sky'})
     client.post(f"/api/v1/sessions/{s1['id']}/messages", headers=H, json={'content': 'Display in my bedroom for peaceful sleep'})
-    client.post(f"/api/v1/sessions/{s1['id']}/generate", headers=H)
+    client.post(f"/api/v1/sessions/{s1['id']}/generate", headers=H, params={"wait": True})
     client.post(f"/api/v1/sessions/{s1['id']}/save", headers=H)
     print(f"Session 1 created & saved: {s1['id']}")
 
@@ -33,7 +33,7 @@ def test_full_phase5():
     s2 = client.post('/api/v1/sessions', headers=H, json={'reference_artwork_ids': [mona['id']]}).json()
     client.post(f"/api/v1/sessions/{s2['id']}/messages", headers=H, json={'content': 'I admire the subtle warm earth tones and sfumato lighting'})
     client.post(f"/api/v1/sessions/{s2['id']}/messages", headers=H, json={'content': 'Place in my study room for a contemplative mood'})
-    client.post(f"/api/v1/sessions/{s2['id']}/generate", headers=H)
+    client.post(f"/api/v1/sessions/{s2['id']}/generate", headers=H, params={"wait": True})
     client.post(f"/api/v1/sessions/{s2['id']}/save", headers=H)
     print(f"Session 2 created & saved: {s2['id']}")
 

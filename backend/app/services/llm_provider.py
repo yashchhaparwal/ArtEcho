@@ -307,6 +307,7 @@ class LLMProvider:
         current_user_message: str,
         artwork_metadata_list: List[Dict[str, Any]],
         previous_context_summary: Optional[Dict[str, Any]] = None,
+        include_artwork_description: bool = True,
     ):
         """
         Call 1 of the split: stream the conversational reply token by token.
@@ -314,17 +315,34 @@ class LLMProvider:
         Yields text fragments as they arrive. Raises on transport failure so the
         caller can fall back to the non-streaming path.
         """
-        prev_summary_str = json.dumps(previous_context_summary or {})
+        artworks_block = self._format_artworks(
+            artwork_metadata_list, include_description=include_artwork_description
+        )
+        # The system block holds only what is fixed for the whole session, so
+        # llama.cpp's prefix cache can reuse it across turns. The accumulated
+        # context summary used to live here too — and because it changes every
+        # turn, it invalidated the cache and forced all ~600 prompt tokens to be
+        # re-evaluated each time (measured at ~15s per turn on a 2-core CPU).
+        # Moving it onto the final user message keeps the model equally informed
+        # while leaving everything before that message byte-identical.
         system_prompt = (
             f"{MUSE_PROSE_SYSTEM_PROMPT}\n\n"
-            f"REFERENCE ARTWORKS:\n{self._format_artworks(artwork_metadata_list)}\n\n"
-            f"WHAT YOU ALREADY KNOW ABOUT THE USER:\n{prev_summary_str}\n"
+            f"REFERENCE ARTWORKS:\n{artworks_block}"
         )
         messages = [{"role": "system", "content": system_prompt}]
         for item in (history or [])[-MAX_HISTORY_MESSAGES:]:
             role = "user" if item.get("sender") == "user" else "assistant"
             messages.append({"role": role, "content": item.get("content", "")})
-        messages.append({"role": "user", "content": current_user_message or ""})
+
+        prev_summary = previous_context_summary or {}
+        if any(prev_summary.values()):
+            final_message = (
+                f"WHAT YOU ALREADY KNOW ABOUT THE USER:\n{json.dumps(prev_summary)}\n\n"
+                f"{current_user_message or ''}"
+            )
+        else:
+            final_message = current_user_message or ""
+        messages.append({"role": "user", "content": final_message})
 
         payload = {
             "model": self.ollama_model,
@@ -372,14 +390,54 @@ class LLMProvider:
         happened. Deliberately given a minimal prompt (no persona, no artwork
         metadata, no history) because prompt eval is charged per token.
         """
-        exchange = (
-            f"PREVIOUS SUMMARY:\n{json.dumps(previous_context_summary or {})}\n\n"
-            f"USER SAID:\n{current_user_message}\n\n"
-            f"ASSISTANT REPLIED:\n{assistant_reply}"
+        return self.extract_context_from_exchanges(
+            [(current_user_message, assistant_reply)], previous_context_summary
         )
+
+    def extract_context_from_exchanges(
+        self,
+        exchanges: List[tuple[str, str]],
+        previous_context_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Derive the context delta from one or more exchanges at once.
+
+        Batching matters on a CPU-only host: this call costs roughly as much as
+        the reply itself, and almost all of that is fixed overhead — the
+        extraction system prompt is ~360 tokens while an exchange adds ~60 and
+        the answer is under 30. Folding two turns into a single call therefore
+        costs barely more than one and halves how often the model has to swap
+        between the conversation prompt and this one, which is what made the
+        alternating calls thrash the prefix cache.
+        """
+        if not exchanges:
+            return {}
+
+        summary_block = f"PREVIOUS SUMMARY:\n{json.dumps(previous_context_summary or {})}"
+
+        if len(exchanges) == 1:
+            # The single-turn wording the extraction prompt was tuned against.
+            user_said, assistant_replied = exchanges[0]
+            user_message = (
+                f"{summary_block}\n\n"
+                f"USER SAID:\n{user_said}\n\n"
+                f"ASSISTANT REPLIED:\n{assistant_replied}"
+            )
+        else:
+            # A plain transcript. Numbering the turns instead ("USER SAID 1/2")
+            # was measured at 35s for a single field, against 5-9s and grounded
+            # values this way; and instructing the model to "cover every user
+            # line" made it invent colours nobody mentioned, which would end up
+            # in the image prompt.
+            lines = "\n".join(
+                f"USER: {user_said}\nASSISTANT: {assistant_replied}"
+                for user_said, assistant_replied in exchanges
+            )
+            user_message = f"{summary_block}\n\nEXCHANGE:\n{lines}"
+
         raw = self._call_ollama(
             system_prompt=CONTEXT_EXTRACTION_PROMPT,
-            user_message=exchange,
+            user_message=user_message,
             temperature=0.3,
         )
         return raw if isinstance(raw, dict) else {}
@@ -537,30 +595,44 @@ class LLMProvider:
         return parsed
 
     @staticmethod
-    def _format_artworks(artwork_metadata_list: Optional[List[Dict[str, Any]]]) -> str:
+    def _format_artworks(
+        artwork_metadata_list: Optional[List[Dict[str, Any]]],
+        include_description: bool = True,
+    ) -> str:
         """
         Render the reference artworks as readable text rather than raw JSON.
 
         `visual_summary` — what the vision model actually saw in the image — is
         given its own labelled block because it is the only source of concrete
         detail for a user upload, which has no meaningful title or artist.
+
+        `include_description` exists because prompt evaluation dominates latency
+        on CPU-only hosts (measured at ~21 tokens/sec on a 2-core i3, so every
+        70 tokens of catalogue prose costs the user another ~3 seconds before a
+        single word appears). The opening turn is asked to name a concrete
+        VISUAL detail, which comes from the visual reading rather than the
+        encyclopedic blurb — so that turn drops the description and keeps
+        everything that actually shapes the question.
         """
         if not artwork_metadata_list:
             return "(none)"
+
+        fields = [
+            ("title", "Title"),
+            ("artist", "Artist"),
+            ("year", "Year"),
+            ("movement_style", "Movement/Style"),
+            ("medium", "Medium"),
+        ]
+        if include_description:
+            fields.append(("description", "Description"))
 
         blocks = []
         for index, art in enumerate(artwork_metadata_list, start=1):
             lines = [f"--- Artwork {index} ---"]
             if art.get("is_user_upload"):
                 lines.append("Source: uploaded by the user (no catalogue metadata — rely on the visual reading)")
-            for key, label in (
-                ("title", "Title"),
-                ("artist", "Artist"),
-                ("year", "Year"),
-                ("movement_style", "Movement/Style"),
-                ("medium", "Medium"),
-                ("description", "Description"),
-            ):
+            for key, label in fields:
                 value = art.get(key)
                 if value:
                     lines.append(f"{label}: {value}")

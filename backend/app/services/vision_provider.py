@@ -235,12 +235,29 @@ class VisionProvider:
         return parsed if isinstance(parsed, dict) and parsed else None
 
 
+# Small vision models emit hex codes that are frequently wrong (moondream read
+# The Starry Night's sky as #ff69b6 — hot pink), and the chat model repeats them
+# verbatim, so users saw "the vibrant blue hues of #ff69b6" in the opening
+# question. A hex is never worth showing a person anyway: strip the codes and
+# keep any colour actually named in words.
+_HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+
+
+def _strip_hex_colors(value: str) -> str:
+    cleaned = _HEX_COLOR_RE.sub("", value)
+    # Tidy the gaps and dangling separators the removal leaves behind.
+    cleaned = re.sub(r"\s*,(\s*,)+", ",", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    return cleaned.strip(" ,;:-")
+
+
 def summarize_analysis(analysis: Optional[Dict[str, Any]]) -> str:
     """Flatten a stored analysis into a short block for an LLM prompt."""
     if not analysis:
         return ""
     if set(analysis) == {"description"}:
-        return str(analysis["description"])[:600]
+        return _strip_hex_colors(str(analysis["description"]))[:600]
     labels = {
         "subject": "Subject",
         "dominant_colors": "Colours",
@@ -254,8 +271,13 @@ def summarize_analysis(analysis: Optional[Dict[str, Any]]) -> str:
         value = analysis.get(key)
         if isinstance(value, (list, tuple)):
             value = ", ".join(str(v) for v in value)
-        if value:
-            lines.append(f"{label}: {str(value).strip()}")
+        if not value:
+            continue
+        text = _strip_hex_colors(str(value).strip())
+        # A colours line that was nothing but hex codes has nothing left to say.
+        if not text:
+            continue
+        lines.append(f"{label}: {text}")
     return "\n".join(lines)[:900]
 
 

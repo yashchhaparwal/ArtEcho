@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,11 @@ if settings.BACKEND_CORS_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+        # Vercel gives every preview deployment its own hostname, so listing
+        # them individually is impossible. Set BACKEND_CORS_ORIGIN_REGEX to
+        # something like https://.*\.vercel\.app to admit them all; it stays
+        # empty (and therefore inactive) for local development.
+        allow_origin_regex=settings.BACKEND_CORS_ORIGIN_REGEX or None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -67,6 +73,42 @@ def startup_check():
 
     chain = " -> ".join(name for name, _ in image_service._provider_chain())
     logger.info(f"Startup check: image generation provider chain: {chain}")
+
+    _warm_up_chat_model(ollama_url)
+
+
+def _warm_up_chat_model(ollama_url: str) -> None:
+    """
+    Ask Ollama to load the chat model in the background at boot.
+
+    Otherwise the first person to open a conversation pays the model load on top
+    of their own inference, and on a CPU-only host that is several seconds of
+    unexplained wait tacked onto an already slow first question. Runs on a
+    daemon thread so startup is not delayed, and failure is harmless — the model
+    would simply load on first use, exactly as it did before.
+    """
+    model = getattr(settings, "OLLAMA_MODEL", "")
+    if not model:
+        return
+
+    def warm() -> None:
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                client.post(
+                    f"{ollama_url.rstrip('/')}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": False,
+                        "keep_alive": "30m",
+                        "options": {"num_predict": 1},
+                    },
+                )
+            logger.info(f"Startup check: chat model '{model}' warmed and resident.")
+        except Exception as exc:
+            logger.info(f"Startup check: could not pre-warm '{model}' ({exc}); it will load on first use.")
+
+    threading.Thread(target=warm, name="muse-model-warmup", daemon=True).start()
 
 
 @app.get("/")

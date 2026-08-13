@@ -49,7 +49,7 @@ def test_phase4():
     print(prompt)
 
     # ── Generate artwork (Generation #1) ──────────────────────────────────────
-    gen_res = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H)
+    gen_res = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H, params={'wait': True})
     assert gen_res.status_code == 201, f"Generate failed: {gen_res.text}"
     gen_data = gen_res.json()
     gen_id_1 = gen_data['id']
@@ -60,20 +60,20 @@ def test_phase4():
     print(f"  model_provider: {gen_data['model_provider']}")
 
     # ── Generate critique ─────────────────────────────────────────────────────
-    crit_res = client.post(f'/api/v1/sessions/{session_id}/critique', headers=H)
+    crit_res = client.post(f'/api/v1/sessions/{session_id}/critique', headers=H, params={'wait': True})
     assert crit_res.status_code == 201, f"Critique failed: {crit_res.text}"
     crit_data = crit_res.json()
     print(f"\n--- CRITIQUE ---")
     print(json.dumps(crit_data, indent=2))
 
     # ── Verify idempotency: calling critique again should return existing ──────
-    crit_res2 = client.post(f'/api/v1/sessions/{session_id}/critique', headers=H)
+    crit_res2 = client.post(f'/api/v1/sessions/{session_id}/critique', headers=H, params={'wait': True})
     assert crit_res2.status_code == 201
     assert crit_res2.json()['id'] == crit_data['id'], "Critique should be idempotent"
     print("\n✅ Critique is idempotent (returns same record)")
 
     # ── Regenerate (Generation #2) ────────────────────────────────────────────
-    gen_res2 = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H)
+    gen_res2 = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H, params={'wait': True})
     assert gen_res2.status_code == 201
     gen_data2 = gen_res2.json()
     print(f"\n--- REGENERATED ARTWORK #2 ---")

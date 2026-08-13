@@ -24,6 +24,8 @@ import base64
 import html
 import logging
 import random
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -40,8 +42,42 @@ GENERATED_DIR.mkdir(exist_ok=True)
 
 # Pollinations occasionally returns a transient 5xx under load; a couple of
 # quick retries is far cheaper than failing the user's generation.
-HTTP_RETRIES = 3
-HTTP_TIMEOUT = 180.0
+#
+# The numbers matter more than they look. A cold generation on the free tier
+# measures ~45s, essentially all of it queue time — model and resolution barely
+# move it. The old settings (3 retries x 180s) meant a bad run could hang for
+# *nine minutes* before falling back to the placeholder, which read to the user
+# as the app being frozen. These bound the worst case to a little over two
+# minutes while still leaving generous headroom over the 45s norm.
+HTTP_RETRIES = 2
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=15.0, pool=10.0)
+
+# Hard ceiling across all attempts for a single provider, so retries can never
+# stack into an unbounded wait.
+PROVIDER_DEADLINE_SECONDS = 150.0
+
+# Backoff between retries. Pollinations rate-limits anonymous callers, so an
+# immediate retry tends to draw the same rejection.
+RETRY_BACKOFF_SECONDS = 2.0
+
+# One pooled client for the process. Building a fresh client per attempt threw
+# away the connection and paid for a new TLS handshake every time.
+_http_client: Optional[httpx.Client] = None
+_http_client_lock = threading.Lock()
+
+
+def _client() -> httpx.Client:
+    global _http_client
+    if _http_client is None:
+        with _http_client_lock:
+            if _http_client is None:
+                _http_client = httpx.Client(
+                    timeout=HTTP_TIMEOUT,
+                    follow_redirects=True,
+                    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                    headers={"User-Agent": "Muse/1.0 (+local art synthesis app)"},
+                )
+    return _http_client
 
 
 class ImageGenerationError(Exception):
@@ -177,10 +213,9 @@ class ImageProvider:
             "seed": seed,
             "sampler_name": "DPM++ 2M Karras",
         }
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-            res = client.post(f"{self.sd_webui_url}/sdapi/v1/txt2img", json=payload)
-            res.raise_for_status()
-            images = res.json().get("images") or []
+        res = _client().post(f"{self.sd_webui_url}/sdapi/v1/txt2img", json=payload)
+        res.raise_for_status()
+        images = res.json().get("images") or []
         if not images:
             raise ImageGenerationError("local SD returned no images")
         return self._store(
@@ -199,11 +234,10 @@ class ImageProvider:
             "inputs": prompt,
             "parameters": {"width": self.width, "height": self.height, "seed": seed},
         }
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-            res = client.post(url, headers=headers, json=payload)
-            if not res.is_success:
-                raise ImageGenerationError(f"HTTP {res.status_code}: {res.text[:200]}")
-            content = res.content
+        res = _client().post(url, headers=headers, json=payload)
+        if not res.is_success:
+            raise ImageGenerationError(f"HTTP {res.status_code}: {res.text[:200]}")
+        content = res.content
         if not content.startswith(b"\xff\xd8") and not content.startswith(b"\x89PNG"):
             raise ImageGenerationError(f"unexpected response: {content[:200]!r}")
         return self._store(
@@ -228,16 +262,15 @@ class ImageProvider:
             "quality": "standard",
             "response_format": "url",
         }
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-            res = client.post(
-                "https://api.openai.com/v1/images/generations", headers=headers, json=payload
+        res = _client().post(
+            "https://api.openai.com/v1/images/generations", headers=headers, json=payload
+        )
+        if not res.is_success:
+            error_data = res.json().get("error", {})
+            raise ImageGenerationError(
+                f"{error_data.get('code', 'unknown')}: {error_data.get('message', res.text)}"
             )
-            if not res.is_success:
-                error_data = res.json().get("error", {})
-                raise ImageGenerationError(
-                    f"{error_data.get('code', 'unknown')}: {error_data.get('message', res.text)}"
-                )
-            image_url = res.json()["data"][0]["url"]
+        image_url = res.json()["data"][0]["url"]
 
         return self._store(
             self._fetch_bytes(image_url),
@@ -252,19 +285,26 @@ class ImageProvider:
     @staticmethod
     def _fetch_bytes(url: str) -> bytes:
         last_error: Optional[Exception] = None
+        deadline = time.monotonic() + PROVIDER_DEADLINE_SECONDS
+
         for attempt in range(HTTP_RETRIES):
+            if time.monotonic() >= deadline:
+                logger.warning("Image fetch deadline exceeded; giving up early")
+                break
             try:
-                with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-                    res = client.get(url)
-                    res.raise_for_status()
-                    if not res.content:
-                        raise ImageGenerationError("empty response body")
-                    return res.content
+                res = _client().get(url)
+                res.raise_for_status()
+                if not res.content:
+                    raise ImageGenerationError("empty response body")
+                return res.content
             except Exception as exc:
                 last_error = exc
-                if attempt < HTTP_RETRIES - 1:
+                remaining = deadline - time.monotonic()
+                if attempt < HTTP_RETRIES - 1 and remaining > RETRY_BACKOFF_SECONDS:
                     logger.info(f"Image fetch attempt {attempt + 1} failed ({exc}); retrying")
-        raise ImageGenerationError(str(last_error))
+                    time.sleep(RETRY_BACKOFF_SECONDS)
+
+        raise ImageGenerationError(str(last_error) if last_error else "image fetch timed out")
 
     def _store(
         self, content: bytes, provider: str, prompt: str, seed: int, ext: str

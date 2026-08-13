@@ -41,6 +41,10 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://localhost:3000",
     ]
+    # Regex alternative for hosts whose origin isn't known ahead of time —
+    # notably Vercel preview deployments, which get a fresh hostname per commit.
+    # Example: https://.*\.vercel\.app
+    BACKEND_CORS_ORIGIN_REGEX: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"

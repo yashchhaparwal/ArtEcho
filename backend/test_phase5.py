@@ -28,7 +28,7 @@ def test_phase5():
     client.post(f'/api/v1/sessions/{session_id}/messages', headers=H, json={'content': 'I want to place it in my bedroom for serene rest'})
 
     # 4. Generate artwork
-    gen = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H).json()
+    gen = client.post(f'/api/v1/sessions/{session_id}/generate', headers=H, params={'wait': True}).json()
     print(f"Generated artwork URL: {gen['image_url']}")
 
     # 5. Save session
